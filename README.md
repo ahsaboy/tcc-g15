@@ -25,6 +25,7 @@ Supported models (as reported by the users):
 - Dell Alienware m16 R1
 - Dell G3 3590, G3 15 3500
 - Dell Alienware 16X Aurora
+- Dell Alienware 18 Area-51 AA18250
 
 May also work on other Dell G15 / Alienware laptops.
 
