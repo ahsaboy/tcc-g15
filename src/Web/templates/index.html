@@ -14,7 +14,7 @@ body{font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',Roboto,sans-serif;b
 .status-dot{width:10px;height:10px;border-radius:50%;display:inline-block;margin-right:8px}
 .status-dot.on{background:#34a853}
 .status-dot.off{background:#f44336}
-.container{max-width:900px;margin:0 auto;padding:16px}
+.container{max-width:80%;margin:0 auto;padding:16px}
 .cards{display:grid;grid-template-columns:1fr 1fr;gap:16px;margin-bottom:16px}
 @media(max-width:600px){.cards{grid-template-columns:1fr}}
 .card{background:#252525;border-radius:8px;padding:16px;border:1px solid #333}
@@ -160,14 +160,14 @@ body{font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',Roboto,sans-serif;b
       <thead>
         <tr>
           <th style="width:40px">#</th>
-          <th style="width:60px">PID</th>
-          <th style="width:160px">Name</th>
-          <th style="width:90px" data-sort="cpu_percent">CPU %</th>
-          <th style="width:90px">Memory</th>
-          <th style="width:80px" data-sort="memory_percent">Mem %</th>
-          <th style="width:60px">Threads</th>
-          <th style="width:150px">Start Time</th>
-          <th>Path</th>
+          <th style="width:60px" data-sort="pid">PID <span class="sort-arrow"></span></th>
+          <th style="width:160px" data-sort="name">Name <span class="sort-arrow"></span></th>
+          <th style="width:90px" data-sort="cpu_percent">CPU % <span class="sort-arrow"></span></th>
+          <th style="width:90px" data-sort="memory_mb">Memory <span class="sort-arrow"></span></th>
+          <th style="width:80px" data-sort="memory_percent">Mem % <span class="sort-arrow"></span></th>
+          <th style="width:60px" data-sort="threads">Threads <span class="sort-arrow"></span></th>
+          <th style="width:150px" data-sort="create_time">Start Time <span class="sort-arrow"></span></th>
+          <th data-sort="exe">Path <span class="sort-arrow"></span></th>
         </tr>
       </thead>
       <tbody id="procBody">
@@ -341,20 +341,27 @@ function onProcParamChange(){
   if(procActiveTab)startProcStream();
 }
 
+// --- Client-side sort ---
+let lastProcData=[];
+let sortCol='';
+let sortAsc=true;
+
 function renderProcesses(procs){
   try{
+    if(procs&&procs.length>0) lastProcData=procs;
     const body=document.getElementById('procBody');
     const empty=document.getElementById('procEmpty');
-    if(!procs||procs.length===0){
+    const data=sortCol?doSort(lastProcData,sortCol,sortAsc):lastProcData;
+    if(!data||data.length===0){
       body.innerHTML='';
       empty.textContent='No processes found';
       empty.style.display='block';
       return;
     }
     empty.style.display='none';
-    const maxCpu=Math.max(...procs.map(p=>p.cpu_percent),1);
-    const maxMem=Math.max(...procs.map(p=>p.memory_percent),1);
-    body.innerHTML=procs.map((p,i)=>{
+    const maxCpu=Math.max(...data.map(p=>p.cpu_percent),1);
+    const maxMem=Math.max(...data.map(p=>p.memory_percent),1);
+    body.innerHTML=data.map((p,i)=>{
       const cpuW=Math.min(100,p.cpu_percent/maxCpu*100);
       const memW=Math.min(100,p.memory_percent/maxMem*100);
       const name=escHtml(p.name);
@@ -371,11 +378,47 @@ function renderProcesses(procs){
         +'<td title="'+exe+'">'+exe+'</td>'
         +'</tr>';
     }).join('');
+    updateSortArrows();
   }catch(e){
     console.error('renderProcesses error:',e);
     document.getElementById('procStatus').textContent='Render error: '+e.message;
   }
 }
+
+function doSort(data,col,asc){
+  const numCols=['pid','cpu_percent','memory_mb','memory_percent','threads'];
+  const isNum=numCols.includes(col);
+  return data.slice().sort((a,b)=>{
+    let va=a[col],vb=b[col];
+    if(isNum){va=va||0;vb=vb||0}
+    else{va=(va||'').toString().toLowerCase();vb=(vb||'').toString().toLowerCase()}
+    if(va<vb)return asc?-1:1;
+    if(va>vb)return asc?1:-1;
+    return 0;
+  });
+}
+
+function updateSortArrows(){
+  document.querySelectorAll('.proc-table th[data-sort]').forEach(th=>{
+    const arrow=th.querySelector('.sort-arrow');
+    if(!arrow)return;
+    if(th.dataset.sort===sortCol){
+      arrow.textContent=sortAsc?' ▲':' ▼';
+    }else{
+      arrow.textContent='';
+    }
+  });
+}
+
+document.querySelectorAll('.proc-table th[data-sort]').forEach(th=>{
+  th.addEventListener('click',e=>{
+    if(e.target.classList.contains('resize-handle'))return;
+    const col=th.dataset.sort;
+    if(sortCol===col){sortAsc=!sortAsc}
+    else{sortCol=col;sortAsc=true}
+    renderProcesses(null);
+  });
+});
 
 function escHtml(s){
   if(!s)return'';
