@@ -33,12 +33,10 @@ class WebBridge(QtCore.QObject):
             return dict(self._state)
 
     def set_mode(self, mode: str) -> None:
-        print(f"[WebBridge] set_mode queued: {mode}", flush=True)
         self._commands.put(("mode", mode))
         self.commandQueued.emit()
 
     def set_fan_speeds(self, gpu_speed: int, cpu_speed: int) -> None:
-        print(f"[WebBridge] set_fan_speeds queued: gpu={gpu_speed} cpu={cpu_speed}", flush=True)
         self._commands.put(("fan", gpu_speed, cpu_speed))
         self.commandQueued.emit()
 
@@ -48,7 +46,6 @@ class WebBridge(QtCore.QObject):
                 cmd = self._commands.get_nowait()
             except queue.Empty:
                 break
-            print(f"[WebBridge] processing command: {cmd}", flush=True)
             if cmd[0] == "mode":
                 callback("mode", cmd[1])
             elif cmd[0] == "fan":

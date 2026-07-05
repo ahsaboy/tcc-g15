@@ -1,22 +1,36 @@
 import base64
+import datetime
 import json
+import logging
 import socket
 import sys
 import threading
-from http.server import HTTPServer, ThreadingHTTPServer, BaseHTTPRequestHandler
+import time
 from typing import Optional
+
+import bottle
+from bottle import Bottle, request, response, HTTPResponse
+import waitress
+
+import psutil
+
+# Suppress waitress request logging
+logging.getLogger('waitress').setLevel(logging.WARNING)
+
 from Web.WebBridge import WebBridge
 
+# Limit concurrent SSE connections to avoid thread exhaustion
+_SSE_SEMAPHORE = threading.Semaphore(4)
 
-INDEX_HTML_BYTES: bytes | None = None
 FAVICON_BYTES: bytes | None = None
+_INDEX_HTML_BYTES: bytes | None = None
 
 
 def _get_index_html_bytes() -> bytes:
-    global INDEX_HTML_BYTES
-    if INDEX_HTML_BYTES is None:
-        INDEX_HTML_BYTES = _build_index_html().encode("utf-8")
-    return INDEX_HTML_BYTES
+    global _INDEX_HTML_BYTES
+    if _INDEX_HTML_BYTES is None:
+        _INDEX_HTML_BYTES = _build_index_html().encode("utf-8")
+    return _INDEX_HTML_BYTES
 
 
 def _get_favicon_bytes() -> bytes:
@@ -43,144 +57,331 @@ _RESP_404 = b'{"ok":false,"error":"Not found"}'
 _RESP_401 = b'{"ok":false,"error":"Unauthorized"}'
 
 
-class WebRequestHandler(BaseHTTPRequestHandler):
-    bridge: WebBridge = None  # Set by server before start
-    auth_enabled: bool = False
-    auth_user: str = ""
-    auth_pass: str = ""
+# Fast scan: only the cheapest attrs. 'exe' and 'username' are expensive on Windows
+# (require per-process system calls) — defer them to pass 2 for top candidates only.
+_PROC_ATTRS_SCAN = ['pid', 'name', 'memory_info', 'memory_percent']
 
-    def log_message(self, format, *args):
-        pass  # Suppress default HTTP logging
+def _collect_processes(sort_by: str = "cpu", num: int = 20) -> list[dict]:
+    """Collect top N processes sorted by cpu or memory.
 
-    def _check_access(self) -> bool:
-        """Check Basic Auth. Returns False if request was rejected (response already sent)."""
-        if self.auth_enabled:
-            auth_header = self.headers.get("Authorization", "")
-            if not auth_header.startswith("Basic "):
-                self.send_response(401)
-                self.send_header("WWW-Authenticate", 'Basic realm="TCC-G15"')
-                self.send_header("Content-Type", "application/json")
-                self.end_headers()
-                self.wfile.write(_RESP_401)
-                return False
-            try:
-                decoded = base64.b64decode(auth_header[6:]).decode("utf-8")
-                user, passwd = decoded.split(":", 1)
-            except Exception:
-                self._send_json(401, _RESP_401)
-                return False
-            if user != self.auth_user or passwd != self.auth_pass:
-                self.send_response(401)
-                self.send_header("WWW-Authenticate", 'Basic realm="TCC-G15"')
-                self.send_header("Content-Type", "application/json")
-                self.end_headers()
-                self.wfile.write(_RESP_401)
-                return False
-        return True
-
-    def _send_json(self, status: int, body: bytes) -> None:
-        self.send_response(status)
-        self.send_header("Content-Type", "application/json")
-        self.send_header("Access-Control-Allow-Origin", "*")
-        self.send_header("Access-Control-Allow-Methods", "GET, POST, OPTIONS")
-        self.send_header("Access-Control-Allow-Headers", "Content-Type")
-        self.end_headers()
-        self.wfile.write(body)
-
-    def _read_body(self) -> dict:
-        length = int(self.headers.get("Content-Length", 0))
-        if length == 0:
-            return {}
-        return json.loads(self.rfile.read(length))
-
-    def do_OPTIONS(self) -> None:
-        self._send_json(204, b"")
-
-    def do_GET(self) -> None:
+    Strategy:
+    1. Fast scan all processes with cheapest attrs (no exe/status/num_threads)
+    2. Pre-sort by memory, take top candidates; fetch exe+create_time only for them
+    3. Compute cpu_percent + num_threads only for final candidates
+    """
+    # Pass 1: fast scan — minimal attrs to reduce per-process system calls
+    all_procs = []
+    for p in psutil.process_iter(attrs=_PROC_ATTRS_SCAN):
         try:
-            if not self._check_access():
-                return
-            if self.path == "/" or self.path == "/index.html":
-                self.send_response(200)
-                self.send_header("Content-Type", "text/html; charset=utf-8")
-                self.end_headers()
-                self.wfile.write(_get_index_html_bytes())
-            elif self.path == "/api/status":
-                status = self.bridge.get_status()
-                self._send_json(200, json.dumps(status).encode())
-            elif self.path == "/favicon.ico":
-                favicon = _get_favicon_bytes()
-                if favicon:
-                    self.send_response(200)
-                    self.send_header("Content-Type", "image/x-icon")
-                    self.end_headers()
-                    self.wfile.write(favicon)
-                else:
-                    self.send_response(404)
-                    self.end_headers()
-            else:
-                self.send_response(404)
-                self.end_headers()
-        except (ConnectionAbortedError, BrokenPipeError, OSError):
-            pass
+            mem_info = p.info.get('memory_info')
+            if mem_info is None:
+                continue
+            mem_mb = round(mem_info.rss / (1024 * 1024), 1)
+            mem_pct = round(p.info.get('memory_percent', 0) or 0, 2)
+            all_procs.append({
+                "proc": p,
+                "pid": p.info.get('pid', 0),
+                "name": p.info.get('name', '') or '',
+                "memory_mb": mem_mb,
+                "memory_percent": mem_pct,
+            })
+        except (psutil.NoSuchProcess, psutil.AccessDenied, psutil.ZombieProcess):
+            continue
 
-    def do_POST(self) -> None:
-        print(f"[WebServer] POST {self.path} from {self.client_address}", flush=True)
-        if not self._check_access():
+    # Pre-sort by memory, take 2x candidates
+    all_procs.sort(key=lambda x: x['memory_percent'], reverse=True)
+    candidates = all_procs[:num * 2]
+
+    # Pass 2: fetch expensive attrs (exe, create_time) only for candidates
+    for item in candidates:
+        p = item['proc']
+        try:
+            ct = p.create_time()
+            item['create_time'] = datetime.datetime.fromtimestamp(ct).strftime("%Y-%m-%d %H:%M:%S") if ct else ""
+        except (psutil.NoSuchProcess, psutil.AccessDenied, OSError, ValueError):
+            item['create_time'] = ""
+        try:
+            item['exe'] = p.exe() or ''
+        except (psutil.NoSuchProcess, psutil.AccessDenied):
+            item['exe'] = ''
+
+    # Pass 3: cpu_percent + num_threads only for final candidates
+    for item in candidates:
+        p = item.pop('proc')
+        try:
+            cpu = p.cpu_percent(interval=0)
+            item['cpu_percent'] = round(cpu, 1)
+            item['threads'] = p.num_threads()
+        except (psutil.NoSuchProcess, psutil.AccessDenied):
+            item['cpu_percent'] = 0.0
+            item['threads'] = 0
+
+    key = "cpu_percent" if sort_by == "cpu" else "memory_percent"
+    candidates.sort(key=lambda x: x[key], reverse=True)
+    return candidates[:num]
+
+
+def _parse_process_params(params) -> tuple:
+    """Parse sort_by and num query parameters for the /api/processes endpoints."""
+    sort_by = params.get('type', 'cpu')
+    if sort_by not in ('cpu', 'memory'):
+        sort_by = 'cpu'
+    try:
+        num = int(params.get('num', '20'))
+    except (ValueError, TypeError):
+        num = 20
+    num = max(1, min(100, num))
+    return sort_by, num
+
+
+# ---------------------------------------------------------------------------
+# Bottle app factory
+# ---------------------------------------------------------------------------
+
+_RESP_429_TOO_MANY = b'{"ok":false,"error":"Too many failed attempts, try again later"}'
+
+
+def _create_app(bridge: WebBridge,
+                auth_enabled: bool = False,
+                auth_user: str = "",
+                auth_pass: str = "") -> Bottle:
+    """Create and configure a Bottle application."""
+
+    app = Bottle()
+
+    # -- Auth rate limiting state --
+    _auth_failures: dict[str, list[float]] = {}  # ip -> list of failure timestamps
+    _AUTH_MAX_FAILURES = 5
+    _AUTH_LOCKOUT_SEC = 60
+
+    # -- CORS hook (runs after every request) --
+    @app.hook('after_request')
+    def _cors():
+        if response.content_type != 'text/event-stream':
+            response.set_header('Access-Control-Allow-Origin', '*')
+            response.set_header('Access-Control-Allow-Methods', 'GET, POST, OPTIONS')
+            response.set_header('Access-Control-Allow-Headers', 'Content-Type')
+
+    # -- Auth hook (runs before every request) --
+    @app.hook('before_request')
+    def _auth():
+        if not auth_enabled:
             return
+        client_ip = request.get_header('X-Forwarded-For', request.remote_addr)
+
+        # Rate limiting check
+        now = time.time()
+        if client_ip in _auth_failures:
+            # Prune old entries
+            _auth_failures[client_ip] = [t for t in _auth_failures[client_ip] if now - t < _AUTH_LOCKOUT_SEC]
+            if len(_auth_failures[client_ip]) >= _AUTH_MAX_FAILURES:
+                raise HTTPResponse(
+                    body=_RESP_429_TOO_MANY,
+                    status=429,
+                    headers={
+                        'Content-Type': 'application/json',
+                        'Retry-After': str(_AUTH_LOCKOUT_SEC),
+                    },
+                )
+
+        auth_header = request.get_header('Authorization', '')
+        if not auth_header.startswith('Basic '):
+            _auth_failures.setdefault(client_ip, []).append(now)
+            raise HTTPResponse(
+                body=_RESP_401,
+                status=401,
+                headers={
+                    'Content-Type': 'application/json',
+                    'WWW-Authenticate': 'Basic realm="TCC-G15"',
+                },
+            )
         try:
-            body = self._read_body()
-        except Exception as ex:
-            print(f"[WebServer] _read_body failed: {ex}", flush=True)
+            decoded = base64.b64decode(auth_header[6:]).decode('utf-8')
+            user, passwd = decoded.split(':', 1)
+        except Exception:
+            _auth_failures.setdefault(client_ip, []).append(now)
+            raise HTTPResponse(
+                body=_RESP_401,
+                status=401,
+                headers={'Content-Type': 'application/json'},
+            )
+        if user != auth_user or passwd != auth_pass:
+            _auth_failures.setdefault(client_ip, []).append(now)
+            raise HTTPResponse(
+                body=_RESP_401,
+                status=401,
+                headers={
+                    'Content-Type': 'application/json',
+                    'WWW-Authenticate': 'Basic realm="TCC-G15"',
+                },
+            )
+        # Auth success — clear failures for this IP
+        _auth_failures.pop(client_ip, None)
+
+    # -- CORS preflight --
+    @app.route('/api/<:re:.*>', method='OPTIONS')
+    def _cors_options(path=''):
+        return ''
+
+    # -- Index --
+    @app.route('/')
+    @app.route('/index.html')
+    def _index():
+        response.content_type = 'text/html; charset=utf-8'
+        response.set_header('Cache-Control', 'no-cache, no-store, must-revalidate')
+        response.set_header('Pragma', 'no-cache')
+        response.set_header('Expires', '0')
+        return _get_index_html_bytes()
+
+    # -- API: status --
+    @app.route('/api/status')
+    def _api_status():
+        response.content_type = 'application/json'
+        return bridge.get_status()
+
+    # -- API: status SSE stream --
+    @app.route('/api/status/stream')
+    def _api_status_stream():
+        if not _SSE_SEMAPHORE.acquire(timeout=2):
+            response.content_type = 'application/json'
+            raise HTTPResponse(
+                body=b'{"ok":false,"error":"Too many SSE connections"}',
+                status=429,
+                headers={'Content-Type': 'application/json', 'Retry-After': '5'},
+            )
+        response.content_type = 'text/event-stream; charset=utf-8'
+        response.set_header('Cache-Control', 'no-cache, no-transform')
+        response.set_header('X-Accel-Buffering', 'no')
+        response.set_header('Access-Control-Allow-Origin', '*')
+        _SSE_MAX_LIFETIME = 300  # Force reconnect every 5 minutes
+        _SSE_HEARTBEAT_INTERVAL = 30
+        def generate():
+            start_time = time.time()
+            last_heartbeat = start_time
             try:
-                self._send_json(400, _RESP_400_INVALID_JSON)
-            except Exception:
-                pass
-            return
+                while True:
+                    if time.time() - start_time > _SSE_MAX_LIFETIME:
+                        yield b": lifetime-reached\n\n"
+                        break
+                    now = time.time()
+                    if now - last_heartbeat >= _SSE_HEARTBEAT_INTERVAL:
+                        yield b": heartbeat\n\n"
+                        last_heartbeat = now
+                    try:
+                        status = bridge.get_status()
+                        data = json.dumps(status)
+                        yield f"data: {data}\n\n".encode('utf-8')
+                    except Exception as e:
+                        yield f"data: {json.dumps({'error': str(e)})}\n\n".encode('utf-8')
+                    time.sleep(2)  # Status stream: push every 2s (reduced from 1s to lower CPU)
+            finally:
+                _SSE_SEMAPHORE.release()
+        return generate()
 
+    # -- API: processes (GET) --
+    @app.route('/api/processes')
+    def _api_processes():
+        response.content_type = 'application/json'
+        sort_by, num = _parse_process_params(request.params)
+        procs = _collect_processes(sort_by, num)
+        return {'ok': True, 'type': sort_by, 'num': num, 'processes': procs}
+
+    # -- API: processes SSE stream --
+    @app.route('/api/processes/stream')
+    def _api_processes_stream():
+        if not _SSE_SEMAPHORE.acquire(timeout=2):
+            response.content_type = 'application/json'
+            raise HTTPResponse(
+                body=b'{"ok":false,"error":"Too many SSE connections"}',
+                status=429,
+                headers={'Content-Type': 'application/json', 'Retry-After': '5'},
+            )
+        response.content_type = 'text/event-stream; charset=utf-8'
+        response.set_header('Cache-Control', 'no-cache, no-transform')
+        response.set_header('X-Accel-Buffering', 'no')
+        response.set_header('Access-Control-Allow-Origin', '*')
+        # Capture request params before the loop; request is a Bottle thread-local
+        # proxy that may become invalid after the handler returns.
+        initial_sort_by, initial_num = _parse_process_params(request.params)
+        _SSE_MAX_LIFETIME = 300
+        _SSE_HEARTBEAT_INTERVAL = 30
+        def generate():
+            start_time = time.time()
+            last_heartbeat = start_time
+            try:
+                sort_by, num = initial_sort_by, initial_num
+                while True:
+                    if time.time() - start_time > _SSE_MAX_LIFETIME:
+                        yield b": lifetime-reached\n\n"
+                        break
+                    now = time.time()
+                    if now - last_heartbeat >= _SSE_HEARTBEAT_INTERVAL:
+                        yield b": heartbeat\n\n"
+                        last_heartbeat = now
+                    try:
+                        procs = _collect_processes(sort_by, num)
+                        data = json.dumps({'ok': True, 'type': sort_by, 'num': num, 'processes': procs})
+                        yield f"data: {data}\n\n".encode('utf-8')
+                    except Exception as e:
+                        yield f"data: {json.dumps({'ok': False, 'error': str(e)})}\n\n".encode('utf-8')
+                    time.sleep(5)  # Process stream: push every 5s (reduced from 3s to lower CPU)
+            finally:
+                _SSE_SEMAPHORE.release()
+        return generate()
+
+    # -- Favicon --
+    @app.route('/favicon.ico')
+    def _favicon():
+        favicon = _get_favicon_bytes()
+        if favicon:
+            response.content_type = 'image/x-icon'
+            return favicon
+        raise HTTPResponse(body=_RESP_404, status=404, headers={'Content-Type': 'application/json'})
+
+    # -- API: mode --
+    @app.route('/api/mode', method='POST')
+    def _api_mode():
+        response.content_type = 'application/json'
         try:
-            if self.path == "/api/mode":
-                mode = body.get("mode")
-                if mode not in ("Balanced", "G_Mode", "Custom"):
-                    self._send_json(400, _RESP_400_INVALID_MODE)
-                    return
-                print(f"[WebServer] POST /api/mode -> {mode}", flush=True)
-                self.bridge.set_mode(mode)
-                self._send_json(200, _RESP_OK)
+            body = request.json
+        except Exception:
+            raise HTTPResponse(body=_RESP_400_INVALID_JSON, status=400, headers={'Content-Type': 'application/json'})
+        if body is None:
+            raise HTTPResponse(body=_RESP_400_INVALID_JSON, status=400, headers={'Content-Type': 'application/json'})
+        mode = body.get('mode')
+        if mode not in ('Balanced', 'G_Mode', 'Custom'):
+            raise HTTPResponse(body=_RESP_400_INVALID_MODE, status=400, headers={'Content-Type': 'application/json'})
+        bridge.set_mode(mode)
+        return {'ok': True}
 
-            elif self.path == "/api/fan":
-                gpu = body.get("gpu_speed")
-                cpu = body.get("cpu_speed")
-                if gpu is None or cpu is None:
-                    self._send_json(400, _RESP_400_MISSING_SPEED)
-                    return
-                try:
-                    gpu = int(gpu)
-                    cpu = int(cpu)
-                except (ValueError, TypeError):
-                    self._send_json(400, _RESP_400_INVALID_SPEED)
-                    return
-                print(f"[WebServer] POST /api/fan -> gpu={gpu} cpu={cpu}", flush=True)
-                self.bridge.set_fan_speeds(max(0, min(120, gpu)), max(0, min(120, cpu)))
-                self._send_json(200, _RESP_OK)
+    # -- API: fan --
+    @app.route('/api/fan', method='POST')
+    def _api_fan():
+        response.content_type = 'application/json'
+        try:
+            body = request.json
+        except Exception:
+            raise HTTPResponse(body=_RESP_400_INVALID_JSON, status=400, headers={'Content-Type': 'application/json'})
+        if body is None:
+            raise HTTPResponse(body=_RESP_400_INVALID_JSON, status=400, headers={'Content-Type': 'application/json'})
+        gpu = body.get('gpu_speed')
+        cpu = body.get('cpu_speed')
+        if gpu is None or cpu is None:
+            raise HTTPResponse(body=_RESP_400_MISSING_SPEED, status=400, headers={'Content-Type': 'application/json'})
+        try:
+            gpu = int(gpu)
+            cpu = int(cpu)
+        except (ValueError, TypeError):
+            raise HTTPResponse(body=_RESP_400_INVALID_SPEED, status=400, headers={'Content-Type': 'application/json'})
+        bridge.set_fan_speeds(max(0, min(120, gpu)), max(0, min(120, cpu)))
+        return {'ok': True}
 
-            else:
-                self._send_json(404, _RESP_404)
-        except (ConnectionAbortedError, BrokenPipeError, OSError) as ex:
-            print(f"[WebServer] write failed: {ex}", flush=True)
-        except Exception as ex:
-            print(f"[WebServer] unexpected error: {type(ex).__name__}: {ex}", flush=True)
+    return app
 
 
-class QuietHTTPServer(ThreadingHTTPServer):
-    def handle_error(self, request, client_address):
-        exc_type = sys.exc_info()[0]
-        exc_val = sys.exc_info()[1]
-        if exc_type in (ConnectionAbortedError, BrokenPipeError, ConnectionResetError):
-            return  # silently ignore client disconnects
-        print(f"[WebServer] handle_error: {exc_type.__name__}: {exc_val}")
-        super().handle_error(request, client_address)
-
+# ---------------------------------------------------------------------------
+# Threaded WSGI server using waitress (supports streaming/SSE)
+# ---------------------------------------------------------------------------
 
 _cached_lan_ip: Optional[str] = None
 
@@ -198,7 +399,7 @@ class ThreadedHTTPServer(threading.Thread):
         self.auth_enabled = auth_enabled
         self.auth_user = auth_user
         self.auth_pass = auth_pass
-        self._server: Optional[HTTPServer] = None
+        self._server = None
         self._started_event = threading.Event()
         self._stop_event = threading.Event()
 
@@ -208,23 +409,38 @@ class ThreadedHTTPServer(threading.Thread):
     def stop(self) -> None:
         self._stop_event.set()
         if self._server:
-            self._server.shutdown()
+            self._server.close()
 
     def run(self) -> None:
-        handler_class = type("Handler", (WebRequestHandler,), {
-            "bridge": self.bridge,
-            "auth_enabled": self.auth_enabled,
-            "auth_user": self.auth_user,
-            "auth_pass": self.auth_pass,
-        })
+        app = _create_app(
+            bridge=self.bridge,
+            auth_enabled=self.auth_enabled,
+            auth_user=self.auth_user,
+            auth_pass=self.auth_pass,
+        )
+        # Warmup psutil cpu_percent baseline for all processes (non-blocking).
+        # This ensures subsequent cpu_percent(interval=0) calls return meaningful values.
         try:
-            self._server = QuietHTTPServer((self.bind_addr, self.port), handler_class)
+            for p in psutil.process_iter(attrs=['pid']):
+                try:
+                    p.cpu_percent(interval=0)
+                except (psutil.NoSuchProcess, psutil.AccessDenied):
+                    pass
+        except Exception:
+            pass
+        try:
+            self._server = waitress.create_server(
+                app,
+                host=self.bind_addr,
+                port=self.port,
+                threads=4,  # Match SSE semaphore limit to reduce thread overhead
+            )
         except OSError as e:
             print(f"WebServer: failed to start on {self.bind_addr}:{self.port}: {e}")
             return
         self._started_event.set()
         print(f"WebServer: listening on http://{self.bind_addr}:{self.port}")
-        self._server.serve_forever()
+        self._server.run()
         print("WebServer: stopped")
 
     @staticmethod
@@ -242,205 +458,9 @@ class ThreadedHTTPServer(threading.Thread):
 
 
 def _build_index_html() -> str:
-    return r"""<!DOCTYPE html>
-<html lang="en">
-<head>
-<meta charset="UTF-8">
-<meta name="viewport" content="width=device-width, initial-scale=1.0">
-<title>TCC-G15 Web Monitor</title>
-<link rel="icon" href="/favicon.ico" type="image/x-icon">
-<script src="https://cdn.jsdelivr.net/npm/chart.js@4/dist/chart.umd.min.js"></script>
-<style>
-*{margin:0;padding:0;box-sizing:border-box}
-body{font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',Roboto,sans-serif;background:#1a1a1a;color:#ddd;min-height:100vh}
-.header{display:flex;align-items:center;justify-content:space-between;padding:12px 20px;background:#252525;border-bottom:1px solid #333}
-.header h1{font-size:16px;font-weight:600}
-.status-dot{width:10px;height:10px;border-radius:50%;display:inline-block;margin-right:8px}
-.status-dot.on{background:#34a853}
-.status-dot.off{background:#f44336}
-.container{max-width:900px;margin:0 auto;padding:16px}
-.cards{display:grid;grid-template-columns:1fr 1fr;gap:16px;margin-bottom:16px}
-@media(max-width:600px){.cards{grid-template-columns:1fr}}
-.card{background:#252525;border-radius:8px;padding:16px;border:1px solid #333}
-.card h2{font-size:14px;color:#aaa;margin-bottom:12px;text-transform:uppercase;letter-spacing:1px}
-.metric{margin-bottom:10px}
-.metric-label{font-size:12px;color:#888;margin-bottom:4px}
-.metric-bar{height:24px;background:#333;border-radius:4px;overflow:hidden;position:relative}
-.metric-fill{height:100%;border-radius:4px;transition:width .3s}
-.metric-value{position:absolute;right:8px;top:50%;transform:translateY(-50%);font-size:13px;font-weight:600;color:#fff;text-shadow:0 1px 2px rgba(0,0,0,.5)}
-.color-green{background:linear-gradient(90deg,#34a853,#4caf50)}
-.color-yellow{background:linear-gradient(90deg,#f1c232,#ffc107)}
-.color-red{background:linear-gradient(90deg,#f44336,#e53935)}
-.controls{background:#252525;border-radius:8px;padding:16px;border:1px solid #333;margin-bottom:16px}
-.controls h2{font-size:14px;color:#aaa;margin-bottom:12px;text-transform:uppercase;letter-spacing:1px}
-.mode-btns{display:flex;gap:8px;margin-bottom:16px;flex-wrap:wrap}
-.mode-btn{padding:8px 20px;border:1px solid #555;border-radius:6px;background:#333;color:#ddd;cursor:pointer;font-size:14px;transition:all .2s}
-.mode-btn:hover{background:#444}
-.mode-btn.active{background:#1A6497;border-color:#1A6497;color:#fff}
-.fan-control{margin-top:12px}
-.fan-row{display:flex;align-items:center;gap:12px;margin-bottom:8px}
-.fan-row label{min-width:90px;font-size:13px;color:#aaa}
-.fan-row input[type=range]{flex:1;accent-color:#1A6497}
-.fan-row .fan-val{min-width:50px;text-align:right;font-size:13px;font-weight:600}
-.fan-row.disabled{opacity:.4;pointer-events:none}
-.chart-card{background:#252525;border-radius:8px;padding:16px;border:1px solid #333;margin-bottom:16px}
-.chart-card h2{font-size:14px;color:#aaa;margin-bottom:8px;text-transform:uppercase;letter-spacing:1px;display:flex;justify-content:space-between;align-items:center}
-.chart-btns{display:flex;gap:4px}
-.chart-btn{padding:4px 10px;border:1px solid #444;border-radius:4px;background:#333;color:#aaa;cursor:pointer;font-size:11px}
-.chart-btn.active{background:#1A6497;border-color:#1A6497;color:#fff}
-.chart-wrap{height:200px;position:relative}
-.footer{text-align:center;padding:12px;color:#555;font-size:12px}
-</style>
-</head>
-<body>
-<div class="header">
-  <h1>TCC-G15 Web Monitor</h1>
-  <div><span class="status-dot off" id="statusDot"></span><span id="statusText" style="font-size:13px;color:#888">Connecting...</span></div>
-</div>
-<div class="container">
-  <div class="cards">
-    <div class="card">
-      <h2>GPU</h2>
-      <div class="metric">
-        <div class="metric-label">Temperature</div>
-        <div class="metric-bar"><div class="metric-fill color-green" id="gpuTempBar" style="width:0%"></div><div class="metric-value" id="gpuTempVal">-- °C</div></div>
-      </div>
-      <div class="metric">
-        <div class="metric-label">Fan Speed</div>
-        <div class="metric-bar"><div class="metric-fill color-green" id="gpuRpmBar" style="width:0%"></div><div class="metric-value" id="gpuRpmVal">-- RPM</div></div>
-      </div>
-    </div>
-    <div class="card">
-      <h2>CPU</h2>
-      <div class="metric">
-        <div class="metric-label">Temperature</div>
-        <div class="metric-bar"><div class="metric-fill color-green" id="cpuTempBar" style="width:0%"></div><div class="metric-value" id="cpuTempVal">-- °C</div></div>
-      </div>
-      <div class="metric">
-        <div class="metric-label">Fan Speed</div>
-        <div class="metric-bar"><div class="metric-fill color-green" id="cpuRpmBar" style="width:0%"></div><div class="metric-value" id="cpuRpmVal">-- RPM</div></div>
-      </div>
-    </div>
-  </div>
-
-  <div class="controls">
-    <h2>Controls</h2>
-    <div class="mode-btns">
-      <button class="mode-btn" data-mode="Balanced" onclick="setMode('Balanced')">Balanced</button>
-      <button class="mode-btn" data-mode="G_Mode" onclick="setMode('G_Mode')">G-Mode</button>
-      <button class="mode-btn" data-mode="Custom" onclick="setMode('Custom')">Custom</button>
-    </div>
-    <div class="fan-control">
-      <div class="fan-row disabled" id="gpuFanRow">
-        <label>GPU Fan</label>
-        <input type="range" min="0" max="120" value="0" id="gpuFanSlider" oninput="onFanSlider()">
-        <span class="fan-val" id="gpuFanVal">0</span>
-      </div>
-      <div class="fan-row disabled" id="cpuFanRow">
-        <label>CPU Fan</label>
-        <input type="range" min="0" max="120" value="0" id="cpuFanSlider" oninput="onFanSlider()">
-        <span class="fan-val" id="cpuFanVal">0</span>
-      </div>
-    </div>
-  </div>
-
-  <div class="chart-card">
-    <h2>Temperature History <div class="chart-btns"><button class="chart-btn active" data-range="3600" onclick="setChartRange(3600,this)">1H</button><button class="chart-btn" data-range="21600" onclick="setChartRange(21600,this)">6H</button><button class="chart-btn" data-range="86400" onclick="setChartRange(86400,this)">24H</button></div></h2>
-    <div class="chart-wrap"><canvas id="tempChart"></canvas></div>
-  </div>
-
-  <div class="footer">TCC-G15 Web Monitor &mdash; <a href="https://github.com/AlexIII/tcc-g15" style="color:#1A6497">github.com/AlexIII/tcc-g15</a></div>
-</div>
-
-<script>
-// --- IndexedDB ---
-const DB_NAME='TCC_G15_History',DB_STORE='temps',DB_VER=1;
-let db=null;
-function openDB(){return new Promise(r=>{const rq=indexedDB.open(DB_NAME,DB_VER);rq.onupgradeneeded=e=>{const d=e.target.result;if(!d.objectStoreNames.contains(DB_STORE))d.createObjectStore(DB_STORE,{keyPath:'ts'})};rq.onsuccess=e=>{db=e.target.result;r(db)};rq.onerror=()=>r(null)})}
-async function dbAdd(ts,gpu,cpu){if(!db)return;const tx=db.transaction(DB_STORE,'readwrite');tx.objectStore(DB_STORE).put({ts,gpu,cpu})}
-async function dbGetRange(since){if(!db)return[];return new Promise(r=>{const tx=db.transaction(DB_STORE,'readonly');const rq=tx.objectStore(DB_STORE).getAll(IDBKeyRange.lowerBound(since));rq.onsuccess=()=>r(rq.result);rq.onerror=()=>r([])})}
-async function dbClearOld(maxAgeMs){if(!db)return;const cutoff=Date.now()-maxAgeMs;const tx=db.transaction(DB_STORE,'readwrite');const store=tx.objectStore(DB_STORE);const rq=store.openCursor();rq.onsuccess=e=>{const c=e.target.result;if(!c)return;if(c.key<cutoff)c.delete().onsuccess=()=>c.continue();else c.continue()}}
-openDB();
-
-// --- Chart ---
-const ctx=document.getElementById('tempChart').getContext('2d');
-const chartData={labels:[],datasets:[{label:'GPU',data:[],borderColor:'#f44336',backgroundColor:'rgba(244,67,54,.1)',pointRadius:0,borderWidth:2,tension:.3},{label:'CPU',data:[],borderColor:'#ffc107',backgroundColor:'rgba(255,193,7,.1)',pointRadius:0,borderWidth:2,tension:.3}]};
-const chart=new Chart(ctx,{type:'line',data:chartData,options:{responsive:true,maintainAspectRatio:false,animation:{duration:0},scales:{x:{display:true,ticks:{maxTicksLimit:8,color:'#666',font:{size:10}},grid:{color:'#333'}},y:{min:0,max:110,ticks:{color:'#666',font:{size:10}},grid:{color:'#333'}}},plugins:{legend:{labels:{color:'#aaa',font:{size:11}}}}}});
-let chartRange=3600;
-function setChartRange(s,btn){chartRange=s;document.querySelectorAll('.chart-btn').forEach(b=>b.classList.remove('active'));btn.classList.add('active');updateChart()}
-
-async function updateChart(){
-  const since=Date.now()-chartRange*1000;
-  const data=await dbGetRange(since);
-  chart.data.labels=data.map(d=>{const dt=new Date(d.ts);return dt.getHours().toString().padStart(2,'0')+':'+dt.getMinutes().toString().padStart(2,'0')});
-  chart.data.datasets[0].data=data.map(d=>d.gpu);
-  chart.data.datasets[1].data=data.map(d=>d.cpu);
-  chart.update();
-}
-
-// --- Polling ---
-let pollCount=0;
-setInterval(async()=>{
-  try{
-    const res=await fetch('/api/status');
-    if(!res.ok)throw new Error();
-    const d=await res.json();
-    document.getElementById('statusDot').className='status-dot on';
-    document.getElementById('statusText').textContent='Connected';
-    updateUI(d);
-    dbAdd(Date.now(),d.gpu_temp,d.cpu_temp);
-    if(++pollCount%5===0){dbClearOld(86400000*2);updateChart()}
-  }catch{
-    document.getElementById('statusDot').className='status-dot off';
-    document.getElementById('statusText').textContent='Disconnected';
-  }
-},1000);
-
-function updateUI(d){
-  const gpuTemp=d.gpu_temp,cpuTemp=d.cpu_temp,gpuRpm=d.gpu_rpm,cpuRpm=d.cpu_rpm;
-  setBar('gpuTempBar','gpuTempVal',gpuTemp,100,'°C',[72,85]);
-  setBar('cpuTempBar','cpuTempVal',cpuTemp,110,'°C',[85,95]);
-  setBar('gpuRpmBar','gpuRpmVal',gpuRpm,5500,' RPM',null);
-  setBar('cpuRpmBar','cpuRpmVal',cpuRpm,5500,' RPM',null);
-  document.querySelectorAll('.mode-btn').forEach(b=>{b.classList.toggle('active',b.dataset.mode===d.mode)});
-  const isCustom=d.mode==='Custom';
-  document.getElementById('gpuFanRow').className='fan-row'+(isCustom?'':' disabled');
-  document.getElementById('cpuFanRow').className='fan-row'+(isCustom?'':' disabled');
-  if(isCustom&&!fanTimer){
-    if(d.gpu_fan_speed!==null){document.getElementById('gpuFanSlider').value=d.gpu_fan_speed;document.getElementById('gpuFanVal').textContent=d.gpu_fan_speed}
-    if(d.cpu_fan_speed!==null){document.getElementById('cpuFanSlider').value=d.cpu_fan_speed;document.getElementById('cpuFanVal').textContent=d.cpu_fan_speed}
-  }
-}
-
-function setBar(barId,valId,value,max,unit,limits){
-  const pct=Math.max(0,Math.min(100,value/max*100));
-  document.getElementById(barId).style.width=pct+'%';
-  const el=document.getElementById(barId);
-  if(limits){
-    if(value>=limits[1])el.className='metric-fill color-red';
-    else if(value>=limits[0])el.className='metric-fill color-yellow';
-    else el.className='metric-fill color-green';
-  }
-  document.getElementById(valId).textContent=(value!==null?value:'--')+unit;
-}
-
-function setMode(mode){
-  document.querySelectorAll('.mode-btn').forEach(b=>{b.classList.toggle('active',b.dataset.mode===mode)});
-  const isCustom=mode==='Custom';
-  document.getElementById('gpuFanRow').className='fan-row'+(isCustom?'':' disabled');
-  document.getElementById('cpuFanRow').className='fan-row'+(isCustom?'':' disabled');
-  fetch('/api/mode',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({mode})}).catch(()=>{});
-}
-let fanTimer=null;
-function onFanSlider(){
-  document.getElementById('gpuFanVal').textContent=document.getElementById('gpuFanSlider').value;
-  document.getElementById('cpuFanVal').textContent=document.getElementById('cpuFanSlider').value;
-  clearTimeout(fanTimer);
-  fanTimer=setTimeout(()=>{
-    fetch('/api/fan',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({gpu_speed:+document.getElementById('gpuFanSlider').value,cpu_speed:+document.getElementById('cpuFanSlider').value})}).catch(()=>{})
-  },500);
-}
-
-</script>
-</body>
-</html>"""
+    import pathlib, sys
+    if hasattr(sys, '_MEIPASS'):
+        template_path = pathlib.Path(sys._MEIPASS) / "Web" / "templates" / "index.html"
+    else:
+        template_path = pathlib.Path(__file__).resolve().parent / "templates" / "index.html"
+    return template_path.read_text(encoding="utf-8")
