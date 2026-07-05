@@ -10,6 +10,9 @@ from GUI.ThermalUnitWidget import ThermalUnitWidget
 from GUI.QGaugeTrayIcon import QGaugeTrayIcon
 from GUI import HotKey
 from Backend.DetectHardware import DetectHardware
+from Web.WebBridge import WebBridge
+from Web.WebServer import ThreadedHTTPServer
+from Web.Config import load_config, save_config
 
 GUI_ICON = 'icons/gaugeIcon.png'
 
@@ -86,6 +89,8 @@ class SettingsKey(Enum):
     GPUThresholdTemp = "app/fan/gpu/threshold_temp"
     FailSafeIsOnFlag = "app/failsafe_is_on_flag"
     MinimizeOnCloseFlag = "app/minimize_on_close_flag"
+    WebPort = "app/web_port"
+    WebEnabled = "app/web_enabled"
 
 def errorExit(message: str, message2: Optional[str] = None) -> None:
     if not QtWidgets.QApplication.instance():
@@ -181,6 +186,46 @@ class TCC_GUI(QtWidgets.QWidget):
                 self.showNormal()
                 self.activateWindow()
         self.connect(tray, QtCore.SIGNAL("activated(QSystemTrayIcon::ActivationReason)"), onTrayIconActivated)
+        self._tray = tray
+
+        # --- Web Server ---
+        self._webConfig = load_config()
+        # Migrate from QSettings if config has no custom values yet
+        qs_port = self.settings.value(SettingsKey.WebPort.value)
+        qs_enabled = self.settings.value(SettingsKey.WebEnabled.value)
+        if qs_port is not None and self._webConfig["web_port"] == 8080:
+            self._webConfig["web_port"] = int(qs_port)
+        if qs_enabled is not None and not self._webConfig["web_enabled"]:
+            self._webConfig["web_enabled"] = str(qs_enabled).lower() == 'true'
+
+        self._webBridge = WebBridge(self)
+        self._webServer: Optional[ThreadedHTTPServer] = None
+        webMenu = menu.addMenu("Web Server")
+        self._webEnableAction = webMenu.addAction("Enable")
+        self._webEnableAction.setCheckable(True)
+        self._webEnableAction.triggered.connect(self._toggleWebServer)
+        webSetPortAction = webMenu.addAction("Set Port...")
+        webSetPortAction.triggered.connect(self._setWebPort)
+        self._webShowAddrAction = webMenu.addAction("Show Address")
+        self._webShowAddrAction.triggered.connect(self._showWebAddress)
+        self._webShowAddrAction.setEnabled(False)
+        webMenu.addSeparator()
+        webSetBindAction = webMenu.addAction("Set Bind Address...")
+        webSetBindAction.setToolTip("Server bind IP. 0.0.0.0 = all interfaces")
+        webSetBindAction.triggered.connect(self._setBindAddr)
+        webMenu.addSeparator()
+        self._webAuthEnableAction = webMenu.addAction("Enable Auth")
+        self._webAuthEnableAction.setCheckable(True)
+        self._webAuthEnableAction.setChecked(self._webConfig["auth_enabled"])
+        self._webAuthEnableAction.triggered.connect(self._toggleAuth)
+        webSetUserAction = webMenu.addAction("Set Username...")
+        webSetUserAction.triggered.connect(self._setAuthUser)
+        webSetPassAction = webMenu.addAction("Set Password...")
+        webSetPassAction.triggered.connect(self._setAuthPass)
+
+        self._webPort = self._webConfig["web_port"]
+        if self._webConfig["web_enabled"]:
+            self._startWebServer()
 
         # Set up GUI
         self.setObjectName('QMainWindow')
@@ -297,6 +342,19 @@ class TCC_GUI(QtWidgets.QWidget):
         self._thermalGPU.speedSliderChanged(updateFanSpeed)
         self._thermalCPU.speedSliderChanged(updateFanSpeed)
 
+        def _handleWebCmd(cmd, *args):
+            print(f"[WebCmd] received: cmd={cmd} args={args}", flush=True)
+            if cmd == "mode":
+                onModeChange(args[0])
+                self._modeSwitch.setChecked(args[0])
+            elif cmd == "fan":
+                gpuSpeed, cpuSpeed = args
+                self._thermalGPU.setSpeedSlider(gpuSpeed)
+                self._thermalCPU.setSpeedSlider(cpuSpeed)
+                updateFanSpeed()
+        self._handleWebCmd = _handleWebCmd
+        self._webBridge.commandQueued.connect(lambda: self._webBridge.processCommands(self._handleWebCmd))
+
         def onModeChange(val: str):
             self._thermalGPU.setSpeedDisabled(val != ThermalMode.Custom.value)
             self._thermalCPU.setSpeedDisabled(val != ThermalMode.Custom.value)
@@ -363,8 +421,17 @@ class TCC_GUI(QtWidgets.QWidget):
             self.trayIcon = self.trayIcon.resizeForScreen() or self.trayIcon
             self.trayIcon.update((gpuTemp, cpuTemp), self._modeSwitch.getChecked() == ThermalMode.G_Mode.value)
             tray.setIcon(self.trayIcon)
-            tray.setToolTip(f"GPU:    {gpuTemp} °C    {gpuRPM} RPM\nCPU:    {cpuTemp} °C    {cpuRPM} RPM\nMode:    {self._modeSwitch.getChecked().replace('_', ' ')}")
-            
+            webInfo = f"\nWeb:    http://{ThreadedHTTPServer.get_lan_ip()}:{self._webPort}" if self._webServer else ""
+            tray.setToolTip(f"GPU:    {gpuTemp} °C    {gpuRPM} RPM\nCPU:    {cpuTemp} °C    {cpuRPM} RPM\nMode:    {self._modeSwitch.getChecked().replace('_', ' ')}{webInfo}")
+
+            self._webBridge.update(
+                gpu_temp=gpuTemp, gpu_rpm=gpuRPM,
+                cpu_temp=cpuTemp, cpu_rpm=cpuRPM,
+                mode=self._modeSwitch.getChecked(),
+                gpu_fan_speed=self._thermalGPU.getSpeedSlider() if self._modeSwitch.getChecked() == ThermalMode.Custom.value else None,
+                cpu_fan_speed=self._thermalCPU.getSpeedSlider() if self._modeSwitch.getChecked() == ThermalMode.Custom.value else None,
+            )
+
             # Periodically save app settings
             self._saveAppSettings()
 
@@ -377,6 +444,115 @@ class TCC_GUI(QtWidgets.QWidget):
         self.gModeHotKey = HotKey.HotKey(HotKey.G_MODE_KEY, self._gModeKeySignal)
         self._gModeKeySignal.connect(self._onGModeHotKeyPressed)
         self.gModeHotKey.start()
+
+    def _toggleWebServer(self) -> None:
+        if self._webEnableAction.isChecked():
+            self._startWebServer()
+        else:
+            self._stopWebServer()
+
+    def _startWebServer(self) -> None:
+        if self._webServer is not None:
+            return
+        cfg = self._webConfig
+        self._webServer = ThreadedHTTPServer(
+            self._webBridge, self._webPort,
+            bind_addr=cfg.get("bind_addr", "0.0.0.0"),
+            auth_enabled=cfg.get("auth_enabled", False),
+            auth_user=cfg.get("auth_user", "admin"),
+            auth_pass=cfg.get("auth_pass", ""),
+        )
+        self._webServer.start()
+        if self._webServer.wait_until_ready(3):
+            ip = ThreadedHTTPServer.get_lan_ip()
+            self._webEnableAction.setChecked(True)
+            self._webShowAddrAction.setEnabled(True)
+            self._tray.setToolTip(f"Web: http://{ip}:{self._webPort}")
+            self._webConfig["web_enabled"] = True
+            save_config(self._webConfig)
+            print(f"Web server started: http://{ip}:{self._webPort}")
+        else:
+            self._webServer.stop()
+            self._webServer = None
+            self._webEnableAction.setChecked(False)
+            alert("Web Server", f"Failed to start web server on port {self._webPort}", QtWidgets.QMessageBox.Icon.Warning)
+
+    def _stopWebServer(self) -> None:
+        if self._webServer is None:
+            return
+        self._webServer.stop()
+        self._webServer = None
+        self._webEnableAction.setChecked(False)
+        self._webShowAddrAction.setEnabled(False)
+        self._webConfig["web_enabled"] = False
+        save_config(self._webConfig)
+        print("Web server stopped")
+
+    def _setWebPort(self) -> None:
+        port, ok = QtWidgets.QInputDialog.getInt(self, "Web Server Port", "Port:", self._webPort, 1024, 65535)
+        if not ok:
+            return
+        wasRunning = self._webServer is not None
+        if wasRunning:
+            self._stopWebServer()
+        self._webPort = port
+        self._webConfig["web_port"] = port
+        save_config(self._webConfig)
+        if wasRunning:
+            self._startWebServer()
+
+    def _showWebAddress(self) -> None:
+        bind = self._webConfig.get("bind_addr", "0.0.0.0")
+        ip = bind if bind != "0.0.0.0" else ThreadedHTTPServer.get_lan_ip()
+        url = f"http://{ip}:{self._webPort}"
+        QtWidgets.QApplication.clipboard().setText(url)
+        self.toasterMessage(["Web Monitor Address:", url, "Copied to clipboard"], True)
+
+    def _setBindAddr(self) -> None:
+        text, ok = QtWidgets.QInputDialog.getText(
+            self, "Bind Address", "Server bind IP (0.0.0.0 = all interfaces):",
+            QtWidgets.QLineEdit.EchoMode.Normal, self._webConfig.get("bind_addr", "0.0.0.0")
+        )
+        if not ok or not text.strip():
+            return
+        self._webConfig["bind_addr"] = text.strip()
+        save_config(self._webConfig)
+        if self._webServer is not None:
+            self._stopWebServer()
+            self._startWebServer()
+
+    def _toggleAuth(self) -> None:
+        self._webConfig["auth_enabled"] = self._webAuthEnableAction.isChecked()
+        save_config(self._webConfig)
+        if self._webServer is not None:
+            self._stopWebServer()
+            self._startWebServer()
+
+    def _setAuthUser(self) -> None:
+        text, ok = QtWidgets.QInputDialog.getText(
+            self, "Auth Username", "Username:",
+            QtWidgets.QLineEdit.EchoMode.Normal, self._webConfig.get("auth_user", "admin")
+        )
+        if not ok:
+            return
+        self._webConfig["auth_user"] = text
+        save_config(self._webConfig)
+        if self._webServer is not None and self._webConfig.get("auth_enabled"):
+            self._stopWebServer()
+            self._startWebServer()
+
+    def _setAuthPass(self) -> None:
+        text, ok = QtWidgets.QInputDialog.getText(
+            self, "Auth Password", "Password:",
+            QtWidgets.QLineEdit.EchoMode.Password, self._webConfig.get("auth_pass", "")
+        )
+        if not ok:
+            return
+        self._webConfig["auth_pass"] = text
+        save_config(self._webConfig)
+        if self._webServer is not None and self._webConfig.get("auth_enabled"):
+            self._stopWebServer()
+            self._startWebServer()
 
     def updateGaugeTitles(self, gpuModel, cpuModel):
         if gpuModel: self._thermalGPU.setTitle(gpuModel)
@@ -417,10 +593,11 @@ class TCC_GUI(QtWidgets.QWidget):
         errorExit(message, message2)
 
     def _destroy(self):
+        self._stopWebServer()
         if self.gModeHotKey is not None:
             self.gModeHotKey.stop()
             self.gModeHotKey.wait()
-        if self.gModeHotKey is not None:
+        if self._updateGaugesTask is not None:
             self._updateGaugesTask.stop()
         print('Cleanup: done')
 
